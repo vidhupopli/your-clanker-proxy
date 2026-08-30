@@ -1,0 +1,283 @@
+#!/bin/bash
+# Idempotent HAProxy TLS cert + mux cfg + compose mount. Safe on an already-configured box.
+# Invoked by the SSM association (not EC2 user-data). Do not set -x: never print secrets.
+set -euo pipefail
+
+SSM_PEM_PARAMETER='${ssm_pem_parameter}'
+SSM_GATEWAY_TOKEN='${ssm_gateway_token}'
+SSM_XAI_API_KEY='${ssm_xai_api_key}'
+SSM_OPENROUTER_KEY='${ssm_openrouter_key}'
+DOMAIN_NAME='${domain_name}'
+ACME_EMAIL='${acme_email}'
+HOSTED_ZONE_ID='${hosted_zone_id}'
+CONFIG_REV='{{ configRev }}'
+PROXY_DIR=/opt/proxy
+LEGO_VERSION='4.35.2'
+LEGO_BIN=/opt/proxy/bin/lego
+LEGO_PATH=/opt/proxy/lego
+HAPROXY_IMAGE='haproxy:3.0@sha256:9e3eda7a75ff9b51a8b8f90054aa6d39a7505702d610ebd308a1477bd074b176'
+
+log() { echo "configure-tls: $*"; }
+
+log "start $(date -u +%FT%TZ) rev=$${CONFIG_REV}"
+
+retry() {
+  local attempts="$1" delay="$2"
+  shift 2
+  local n=1
+  until "$@"; do
+    if [ "$n" -ge "$attempts" ]; then
+      echo "giving up after $${n} attempts: $*"
+      return 1
+    fi
+    echo "retry $${n}/$${attempts} in $${delay}s: $*"
+    n=$((n + 1))
+    sleep "$delay"
+  done
+}
+
+imds_token() {
+  curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"
+}
+
+TOKEN="$(retry 15 2 imds_token)"
+REGION="$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region)"
+export AWS_DEFAULT_REGION="$REGION"
+export AWS_REGION="$REGION"
+if [ -n "$HOSTED_ZONE_ID" ]; then
+  export AWS_HOSTED_ZONE_ID="$HOSTED_ZONE_ID"
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  retry 10 5 dnf install -y python3
+fi
+if ! command -v aws >/dev/null 2>&1; then
+  retry 10 5 dnf install -y aws-cli
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  log "docker not installed yet; skip (user-data still bootstrapping)"
+  exit 1
+fi
+if ! command -v tar >/dev/null 2>&1; then
+  retry 10 5 dnf install -y tar gzip
+fi
+
+mkdir -p "$PROXY_DIR"
+chmod 0750 "$PROXY_DIR"
+
+# Stage new files, validate HAProxy, then replace. Running mux keeps the old cfg
+# until compose up -d. Do not print PEM or tokens.
+python3 - "$SSM_PEM_PARAMETER" "$PROXY_DIR/haproxy.pem.new" <<'SUBST'
+import json
+import pathlib
+import subprocess
+import sys
+
+name, dest = sys.argv[1], sys.argv[2]
+r = subprocess.run(
+    [
+        "aws",
+        "ssm",
+        "get-parameter",
+        "--name",
+        name,
+        "--with-decryption",
+        "--output",
+        "json",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+value = json.loads(r.stdout)["Parameter"]["Value"]
+if not value or "BEGIN" not in value:
+    raise SystemExit("SSM HAProxy PEM parameter was empty")
+if not value.endswith("\n"):
+    value += "\n"
+pathlib.Path(dest).write_text(value)
+SUBST
+chmod 0644 "$PROXY_DIR/haproxy.pem.new"
+
+install_lego() {
+  mkdir -p /opt/proxy/bin
+  if [ -x "$LEGO_BIN" ] && "$LEGO_BIN" version 2>/dev/null | grep -Fq "$LEGO_VERSION"; then
+    log "lego $LEGO_VERSION already installed"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp -d)"
+  log "installing lego $LEGO_VERSION linux_arm64"
+  retry 5 5 curl -fsSL \
+    "https://github.com/go-acme/lego/releases/download/v$${LEGO_VERSION}/lego_v$${LEGO_VERSION}_linux_arm64.tar.gz" \
+    -o "$tmp/lego.tgz"
+  tar -xzf "$tmp/lego.tgz" -C "$tmp" lego
+  install -m 0755 "$tmp/lego" "$LEGO_BIN"
+  rm -rf "$tmp"
+}
+
+build_le_pem() {
+  local crt="$LEGO_PATH/certificates/$${DOMAIN_NAME}.crt"
+  local key="$LEGO_PATH/certificates/$${DOMAIN_NAME}.key"
+  local issuer="$LEGO_PATH/certificates/$${DOMAIN_NAME}.issuer.crt"
+  local dest="$1"
+  if [ ! -f "$crt" ] || [ ! -f "$key" ]; then
+    log "lego crt/key missing"
+    return 1
+  fi
+  umask 077
+  : > "$dest"
+  cat "$crt" >> "$dest"
+  if [ -f "$issuer" ]; then
+    cat "$issuer" >> "$dest"
+  fi
+  cat "$key" >> "$dest"
+  chmod 0644 "$dest"
+}
+
+issue_lets_encrypt() {
+  mkdir -p "$LEGO_PATH"
+  chmod 0700 "$LEGO_PATH"
+  local args=(
+    --accept-tos
+    --email "$ACME_EMAIL"
+    --dns route53
+    --domains "$DOMAIN_NAME"
+    --path "$LEGO_PATH"
+  )
+  if [ -f "$LEGO_PATH/certificates/$${DOMAIN_NAME}.crt" ]; then
+    log "lego renew --days 30"
+    "$LEGO_BIN" "$${args[@]}" renew --days 30
+  else
+    log "lego run (DNS-01)"
+    "$LEGO_BIN" "$${args[@]}" run
+  fi
+}
+
+install_renew_timer() {
+  mkdir -p /opt/proxy/bin
+  echo '${lego_renew_b64}' | base64 -d > /opt/proxy/bin/lego-renew.sh
+  chmod 0755 /opt/proxy/bin/lego-renew.sh
+
+  cat > /etc/systemd/system/lego-renew.service <<'UNIT'
+[Unit]
+Description=Renew Let's Encrypt cert for HAProxy mux
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/proxy/bin/lego-renew.sh
+Nice=10
+UNIT
+
+  cat > /etc/systemd/system/lego-renew.timer <<'UNIT'
+[Unit]
+Description=Daily Let's Encrypt renew for HAProxy mux
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now lego-renew.timer
+  log "lego-renew.timer enabled"
+}
+
+if [ -n "$DOMAIN_NAME" ]; then
+  if [ -z "$ACME_EMAIL" ]; then
+    log "domain_name set but acme_email empty"
+    exit 1
+  fi
+  install_lego
+  # IAM policy may not be visible on the instance role for a few seconds.
+  if ! retry 4 20 issue_lets_encrypt; then
+    log "lego failed; leaving previous HAProxy pem in place (SSM self-signed remains staged)"
+    exit 1
+  fi
+  if ! build_le_pem "$PROXY_DIR/haproxy.pem.le"; then
+    log "could not build LE pem; leaving previous HAProxy pem in place"
+    exit 1
+  fi
+  cp -f "$PROXY_DIR/haproxy.pem.le" "$PROXY_DIR/haproxy.pem.new"
+  chmod 0644 "$PROXY_DIR/haproxy.pem.new"
+  rm -f "$PROXY_DIR/haproxy.pem.le"
+  log "using Let's Encrypt pem for haproxy.pem.new"
+  install_renew_timer
+fi
+
+echo '${compose_b64}' | base64 -d > "$PROXY_DIR/docker-compose.yml.new"
+chmod 0644 "$PROXY_DIR/docker-compose.yml.new"
+
+echo '${haproxy_b64}' | base64 -d > "$PROXY_DIR/haproxy.cfg.tpl"
+chmod 0644 "$PROXY_DIR/haproxy.cfg.tpl"
+
+fetch_ssm() {
+  aws ssm get-parameter \
+    --name "$1" \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text
+}
+
+GATEWAY_TOKEN="$(retry 30 4 fetch_ssm "$SSM_GATEWAY_TOKEN")"
+XAI_API_KEY=""
+OPENROUTER_API_KEY=""
+if [ -n "$SSM_XAI_API_KEY" ]; then
+  XAI_API_KEY="$(retry 15 4 fetch_ssm "$SSM_XAI_API_KEY")"
+fi
+if [ -n "$SSM_OPENROUTER_KEY" ]; then
+  OPENROUTER_API_KEY="$(retry 15 4 fetch_ssm "$SSM_OPENROUTER_KEY")"
+fi
+
+python3 - "$PROXY_DIR/haproxy.cfg.tpl" "$PROXY_DIR/haproxy.cfg.new" \
+  "$GATEWAY_TOKEN" "$XAI_API_KEY" "$OPENROUTER_API_KEY" <<'SUBST'
+import pathlib
+import sys
+
+src, dest, token, xai, openrouter = sys.argv[1:6]
+
+def esc(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+text = pathlib.Path(src).read_text()
+text = text.replace("__GATEWAY_TOKEN__", esc(token))
+text = text.replace("__XAI_API_KEY__", esc(xai))
+text = text.replace("__OPENROUTER_API_KEY__", esc(openrouter))
+pathlib.Path(dest).write_text(text)
+SUBST
+chmod 0644 "$PROXY_DIR/haproxy.cfg.new"
+rm -f "$PROXY_DIR/haproxy.cfg.tpl"
+unset GATEWAY_TOKEN XAI_API_KEY OPENROUTER_API_KEY
+
+log "validating haproxy cfg"
+docker run --rm \
+  -v "$PROXY_DIR/haproxy.cfg.new:/usr/local/etc/haproxy/haproxy.cfg:ro" \
+  -v "$PROXY_DIR/haproxy.pem.new:/usr/local/etc/haproxy/haproxy.pem:ro" \
+  "$HAPROXY_IMAGE" \
+  haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+
+# Prefer in-place overwrite so a live bind-mount keeps the same inode.
+if [ -f "$PROXY_DIR/haproxy.pem" ]; then
+  cat "$PROXY_DIR/haproxy.pem.new" > "$PROXY_DIR/haproxy.pem"
+  rm -f "$PROXY_DIR/haproxy.pem.new"
+else
+  mv -f "$PROXY_DIR/haproxy.pem.new" "$PROXY_DIR/haproxy.pem"
+fi
+mv -f "$PROXY_DIR/haproxy.cfg.new" "$PROXY_DIR/haproxy.cfg"
+mv -f "$PROXY_DIR/docker-compose.yml.new" "$PROXY_DIR/docker-compose.yml"
+chmod 0644 "$PROXY_DIR/haproxy.pem" "$PROXY_DIR/haproxy.cfg" "$PROXY_DIR/docker-compose.yml"
+
+cd "$PROXY_DIR"
+# HAProxy reads the crt at start; USR2/HUP is unreliable in this image.
+# force-recreate loads a replaced haproxy.pem (bind-mount) without terraform replacing the nano.
+docker compose up -d --force-recreate
+docker compose ps
+
+log "done $(date -u +%FT%TZ)"

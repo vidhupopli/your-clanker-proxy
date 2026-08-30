@@ -1,0 +1,24 @@
+# HTTP CONNECT only. No SOCKS, no TLS intercept / MITM.
+# Auth is always on. Destination host whitelist (or escape hatch) is rendered by Terraform.
+# Password is injected at boot from SSM — never baked into the AMI or git.
+
+nserver 1.1.1.1
+nserver 8.8.8.8
+nscache 65536
+
+# CONNECTION_SHORT/LONG = 1800s so Cursor/Grok SSE idle stays up (>= 10 minutes).
+timeouts 1 5 30 60 1800 1800 15 60
+
+# HTTP CONNECT user (default starman). Password is replaced at boot from SSM.
+users ${proxy_user}:CL:__PROXY_PASSWORD__
+auth strong
+
+# Do not CONNECT back into the instance or RFC1918 / link-local.
+deny * * 127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16
+
+${allow_rules}
+deny *
+
+# -n no client DNS in ACL; -a anonymous (no Via / X-Forwarded-For).
+# Listen port is 443 when this process owns the host, or 3128 behind HAProxy.
+proxy -n -a -p${connect_listen_port}

@@ -1,0 +1,48 @@
+# Copy to terraform.tfvars (gitignored) and edit.
+# ./proxy.sh setup copies this file if terraform.tfvars is missing.
+
+proxy_user    = "starman"
+allowed_cidrs = []
+ssh_enabled   = true
+
+# Optional extra SG restrictor. Empty (default) means roaming clients
+# (ingress TCP 443 and, when ssh_enabled, 22 from 0.0.0.0/0).
+# Password + dest whitelist still apply. SSH is password auth for proxy_user.
+# allowed_cidrs = ["x.x.x.x/32"]  # replace with a public IP if you want to lock the SG
+
+# region         = "ap-south-1"
+# instance_type  = "t4g.nano"
+# If apply fails InsufficientInstanceCapacity (ap-south-1a is often dry):
+# availability_zone = "ap-south-1b"
+# name           = "dev-proxy"
+# proxy_port     = 443
+
+# Add a host, then ./proxy.sh setup. Instance user-data is replaced; EIP stays on the ENI.
+# proxy_allow_dests = [
+#   "*.cursor.sh",
+#   "*.cursor-cdn.com",
+#   "*.cursorapi.com",
+#   "*.cursorvm.com",
+#   "downloads.cursor.com",
+#   "anysphere-binaries.s3.us-east-1.amazonaws.com",
+#   "*.grok.com",
+#   "*.x.ai",
+#   "*.opencode.ai",
+#   "models.dev",
+#   "*.openrouter.ai",
+# ]
+
+# Escape hatch: any CONNECT destination on port 443 (still requires password).
+# proxy_allow_all_dests = false
+
+# Optional HTTP reverse gateway on the SAME TCP 443 (HAProxy mux, HTTP + HTTPS). Not XOR with CONNECT.
+# Leave empty/commented to keep CONNECT-only (identical to a box with no keys).
+# Never commit real keys — terraform.tfvars is gitignored.
+# xai_api_key        = "xai-..."
+# openrouter_api_key = "sk-or-..."
+
+# Optional Let's Encrypt (public CA) on the mux via Route53 DNS-01. Empty = self-signed on the EIP.
+# Requires a public hosted zone for the name in this account. Does not replace the instance.
+# Renewal is a systemd timer on the box (lego); terraform apply is not required to renew.
+# domain_name = "example.com"
+# acme_email  = "you@example.com"

@@ -1,0 +1,171 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/proxy-bootstrap.log) 2>&1
+
+REGION='${region}'
+SSM_PARAMETER_NAME='${ssm_parameter_name}'
+SSM_GATEWAY_TOKEN='${ssm_gateway_token}'
+SSM_XAI_API_KEY='${ssm_xai_api_key}'
+SSM_OPENROUTER_KEY='${ssm_openrouter_key}'
+SSM_HAPROXY_PEM='${ssm_haproxy_pem}'
+GATEWAY_ENABLED='${gateway_enabled}'
+PROXY_DIR=/opt/proxy
+# secrets_rev ${secrets_rev}
+
+echo "bootstrap start $(date -u +%FT%TZ) gateway=$${GATEWAY_ENABLED}"
+
+retry() {
+  local attempts="$1" delay="$2"
+  shift 2
+  local n=1
+  until "$@"; do
+    if [ "$n" -ge "$attempts" ]; then
+      echo "giving up after $${n} attempts: $*"
+      return 1
+    fi
+    echo "retry $${n}/$${attempts} in $${delay}s: $*"
+    n=$((n + 1))
+    sleep "$delay"
+  done
+}
+
+# IMDSv2 (required on this instance). Hop limit is 2 so Docker can reach it if needed.
+imds_token() {
+  curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"
+}
+
+TOKEN="$(retry 15 2 imds_token)"
+IMDS_REGION="$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region || true)"
+if [ -n "$${IMDS_REGION}" ]; then
+  REGION="$${IMDS_REGION}"
+fi
+export AWS_DEFAULT_REGION="$REGION"
+
+retry 20 5 dnf install -y docker
+if ! command -v python3 >/dev/null 2>&1; then
+  retry 10 5 dnf install -y python3
+fi
+if ! command -v aws >/dev/null 2>&1; then
+  retry 10 5 dnf install -y aws-cli
+fi
+if ! dnf install -y docker-compose-plugin; then
+  echo "docker-compose-plugin missing; installing official aarch64 plugin"
+  mkdir -p /usr/local/lib/docker/cli-plugins
+  retry 10 3 curl -fsSL \
+    "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-aarch64" \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose
+  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+fi
+systemctl enable --now docker
+
+mkdir -p "$PROXY_DIR"
+chmod 0750 "$PROXY_DIR"
+
+echo '${compose_b64}' | base64 -d > "$PROXY_DIR/docker-compose.yml"
+echo '${cfg_b64}' | base64 -d > "$PROXY_DIR/3proxy.cfg.tpl"
+chmod 0644 "$PROXY_DIR/docker-compose.yml"
+chmod 0644 "$PROXY_DIR/3proxy.cfg.tpl"
+
+fetch_ssm() {
+  aws ssm get-parameter \
+    --name "$1" \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text
+}
+
+PASSWORD="$(retry 30 4 fetch_ssm "$SSM_PARAMETER_NAME")"
+if [ -z "$PASSWORD" ]; then
+  echo "SSM CONNECT password was empty" >&2
+  exit 1
+fi
+
+python3 - "$PROXY_DIR/3proxy.cfg.tpl" "$PROXY_DIR/3proxy.cfg" "$PASSWORD" <<'SUBST'
+import pathlib
+import sys
+src, dest, password = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(src).read_text()
+pathlib.Path(dest).write_text(text.replace("__PROXY_PASSWORD__", password))
+SUBST
+# 0644: the image runs as uid 10001 and must io.open the :ro bind. Do not use 0600.
+chmod 0644 "$PROXY_DIR/3proxy.cfg"
+rm -f "$PROXY_DIR/3proxy.cfg.tpl"
+unset PASSWORD
+
+if [ "$GATEWAY_ENABLED" = "true" ]; then
+  echo '${haproxy_b64}' | base64 -d > "$PROXY_DIR/haproxy.cfg.tpl"
+  chmod 0644 "$PROXY_DIR/haproxy.cfg.tpl"
+  GATEWAY_TOKEN="$(retry 30 4 fetch_ssm "$SSM_GATEWAY_TOKEN")"
+  XAI_API_KEY=""
+  OPENROUTER_API_KEY=""
+  if [ -n "$SSM_XAI_API_KEY" ]; then
+    XAI_API_KEY="$(retry 15 4 fetch_ssm "$SSM_XAI_API_KEY")"
+  fi
+  if [ -n "$SSM_OPENROUTER_KEY" ]; then
+    OPENROUTER_API_KEY="$(retry 15 4 fetch_ssm "$SSM_OPENROUTER_KEY")"
+  fi
+  python3 - "$PROXY_DIR/haproxy.cfg.tpl" "$PROXY_DIR/haproxy.cfg" \
+    "$GATEWAY_TOKEN" "$XAI_API_KEY" "$OPENROUTER_API_KEY" <<'SUBST'
+import pathlib
+import sys
+
+src, dest, token, xai, openrouter = sys.argv[1:6]
+
+def esc(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+text = pathlib.Path(src).read_text()
+text = text.replace("__GATEWAY_TOKEN__", esc(token))
+text = text.replace("__XAI_API_KEY__", esc(xai))
+text = text.replace("__OPENROUTER_API_KEY__", esc(openrouter))
+pathlib.Path(dest).write_text(text)
+SUBST
+  chmod 0644 "$PROXY_DIR/haproxy.cfg"
+  rm -f "$PROXY_DIR/haproxy.cfg.tpl"
+  unset GATEWAY_TOKEN XAI_API_KEY OPENROUTER_API_KEY
+
+  if [ -z "$SSM_HAPROXY_PEM" ]; then
+    echo "SSM HAProxy PEM parameter name was empty" >&2
+    exit 1
+  fi
+  python3 - "$SSM_HAPROXY_PEM" "$PROXY_DIR/haproxy.pem" <<'SUBST'
+import json
+import pathlib
+import subprocess
+import sys
+
+name, dest = sys.argv[1], sys.argv[2]
+r = subprocess.run(
+    [
+        "aws",
+        "ssm",
+        "get-parameter",
+        "--name",
+        name,
+        "--with-decryption",
+        "--output",
+        "json",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+value = json.loads(r.stdout)["Parameter"]["Value"]
+if not value or "BEGIN" not in value:
+    raise SystemExit("SSM HAProxy PEM parameter was empty")
+if not value.endswith("\n"):
+    value += "\n"
+pathlib.Path(dest).write_text(value)
+SUBST
+  # 0644: official haproxy image user must read the :ro bind. Do not use 0600.
+  chmod 0644 "$PROXY_DIR/haproxy.pem"
+fi
+
+cd "$PROXY_DIR"
+retry 20 5 docker compose pull
+docker compose up -d
+docker compose ps
+
+echo "bootstrap done $(date -u +%FT%TZ)"

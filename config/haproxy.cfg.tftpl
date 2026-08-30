@@ -1,0 +1,102 @@
+# HAProxy mux on public TCP 443. Peek first bytes:
+#   TLS ClientHello -> terminate on loopback :4443, then CONNECT vs gateway
+#   plaintext CONNECT -> 3proxy
+#   plaintext HTTP -> reverse gateway
+# Let's Encrypt when domain_name is set; otherwise self-signed. No SSH-on-443.
+# Secrets (gateway token, xAI key, OpenRouter key) are substituted at boot
+# from SSM using __-delimited placeholders — never committed. Do not put those
+# placeholder names in comments or they will be substituted too.
+
+global
+    maxconn 128
+    log stdout format raw local0
+    tune.bufsize 32768
+
+defaults
+    log global
+    timeout connect 10s
+    timeout client 1800s
+    timeout server 1800s
+    timeout tunnel 1800s
+    timeout http-request 60s
+    timeout http-keep-alive 30s
+    option dontlognull
+    option clitcpka
+    option srvtcpka
+
+resolvers docker
+    nameserver dns 127.0.0.11:53
+    resolve_retries 3
+    timeout resolve 2s
+    timeout retry 1s
+    hold valid 30s
+
+frontend fe_mux
+    bind :${proxy_port}
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    tcp-request content accept if HTTP
+    use_backend be_ssl if { req.ssl_hello_type 1 }
+    use_backend be_connect if { req.payload(0,8) -m beg "CONNECT " }
+    default_backend be_gateway
+
+backend be_ssl
+    mode tcp
+    timeout client 1800s
+    timeout server 1800s
+    timeout tunnel 1800s
+    server tls-term 127.0.0.1:4443
+
+frontend fe_tls
+    bind 127.0.0.1:4443 ssl crt /usr/local/etc/haproxy/haproxy.pem alpn http/1.1
+    mode tcp
+    tcp-request inspect-delay 5s
+    tcp-request content accept if HTTP
+    use_backend be_connect if { req.payload(0,8) -m beg "CONNECT " }
+    default_backend be_gateway
+
+backend be_connect
+    mode tcp
+    timeout client 1800s
+    timeout server 1800s
+    timeout tunnel 1800s
+    server 3proxy proxy:3128 resolvers docker resolve-prefer ipv4 init-addr last,libc,none
+
+backend be_gateway
+    mode http
+    option http-keep-alive
+    timeout client 1800s
+    timeout server 1800s
+    timeout tunnel 1800s
+
+    acl auth_ok req.hdr(Authorization) -m str "Bearer __GATEWAY_TOKEN__"
+%{ if gateway_xai_enabled ~}
+    acl is_xai path_beg /xai/
+%{ endif ~}
+%{ if gateway_openrouter_enabled ~}
+    acl is_or path_beg /openrouter/
+%{ endif ~}
+    acl is_known_gw path_beg ${join(" ", compact([gateway_xai_enabled ? "/xai/" : "", gateway_openrouter_enabled ? "/openrouter/" : ""]))}
+
+    http-request return status 404 content-type "text/plain" string "not found\n" unless is_known_gw
+    http-request return status 401 content-type "text/plain" string "unauthorized\n" unless auth_ok
+
+    http-request del-header Authorization
+%{ if gateway_xai_enabled ~}
+    http-request set-var(txn.dest) str(xai) if is_xai
+    http-request set-header Authorization "Bearer __XAI_API_KEY__" if is_xai
+    http-request set-header Host api.x.ai if is_xai
+    http-request set-path %[path,regsub(^/xai,)] if is_xai
+    use-server xai if { var(txn.dest) -m str xai }
+    server xai api.x.ai:443 ssl sni str(api.x.ai) alpn http/1.1 verify required ca-file /etc/ssl/certs/ca-certificates.crt resolvers docker resolve-prefer ipv4 init-addr last,libc,none
+%{ endif ~}
+%{ if gateway_openrouter_enabled ~}
+    http-request set-var(txn.dest) str(openrouter) if is_or
+    http-request set-header Authorization "Bearer __OPENROUTER_API_KEY__" if is_or
+    http-request set-header Host openrouter.ai if is_or
+    http-request set-path %[path,regsub(^/openrouter,)] if is_or
+    use-server openrouter if { var(txn.dest) -m str openrouter }
+    server openrouter openrouter.ai:443 ssl sni str(openrouter.ai) alpn http/1.1 verify required ca-file /etc/ssl/certs/ca-certificates.crt resolvers docker resolve-prefer ipv4 init-addr last,libc,none
+%{ endif ~}
+    http-response set-header X-Accel-Buffering no

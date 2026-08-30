@@ -1,0 +1,55 @@
+# Terraform interpolates this file into user-data (templatefile).
+# Do not add a SOCKS port. Do not add a second unauthenticated listener.
+# Dockerfile is an unused fallback. 3proxy rootfs is not read_only.
+
+services:
+  proxy:
+    image: ghcr.io/tarampampam/3proxy:2.2.0@sha256:5a3452e1b79b24479572bf657a2c6e771461fa317dc59ef08977831d68cab280
+    container_name: connect-proxy
+    restart: unless-stopped
+%{ if gateway_enabled ~}
+    # Host 443 is HAProxy. 3proxy is loopback-side only on the compose network.
+    expose:
+      - "3128"
+    environment:
+      PROXY_PORT: "3128"
+%{ else ~}
+    ports:
+      - "${proxy_port}:${proxy_port}"
+    environment:
+      PROXY_PORT: "${proxy_port}"
+%{ endif ~}
+    volumes:
+      - ./3proxy.cfg:/etc/3proxy/3proxy.cfg:ro
+    mem_limit: 64m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    security_opt:
+      - no-new-privileges:true
+%{ if gateway_enabled ~}
+
+  haproxy:
+    image: haproxy:3.0@sha256:9e3eda7a75ff9b51a8b8f90054aa6d39a7505702d610ebd308a1477bd074b176
+    container_name: mux-443
+    restart: unless-stopped
+    depends_on:
+      - proxy
+    ports:
+      - "${proxy_port}:${proxy_port}"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy.pem:/usr/local/etc/haproxy/haproxy.pem:ro
+    mem_limit: 64m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    security_opt:
+      - no-new-privileges:true
+%{ endif ~}
